@@ -9,6 +9,7 @@ bar app needs `rumps`.
     python3 claude_usage.py report                 # current window per provider
     python3 claude_usage.py add --model claude-sonnet-5-5 --input 2000 --output 900 --surface web
     python3 claude_usage.py calibrate --provider anthropic --percent 40   # % shown in /usage
+    python3 claude_usage.py models                 # every model: all-time use, share of limit
     python3 claude_usage.py providers              # adapters, profiles, data file
 
 ## How it works
@@ -37,7 +38,8 @@ and providers with no active window show `idle`.
 
 The menu shows reset time, an Activity sparkline (usage across the current window in 10
 slices), and a per-surface/model breakdown for each provider. Claude Code logs are cached by
-file mtime, so refreshes only re-read logs that changed. Calibrate…
+file mtime, so refreshes only re-read logs that changed. A **Models** submenu lists each model seen in the logs, with all-time tokens and its share of
+the current window's limit. Providers and model families have their own icons. Calibrate…
 records the % the provider's usage page shows for the active window, the same as the CLI
 `calibrate` command. It refreshes
 every 60 seconds. It sends a notification when a window crosses 70% or 90%, once per threshold
@@ -75,5 +77,7 @@ Verify the provider's log or usage format before writing the adapter.
 
 - Subscription caps are not published as token counts. Ceilings come from calibration
   and are estimates.
+- Limits are per provider. Models are not limited separately, so the model list shows
+  each model's share of the shared window rather than its own cap.
 - Web and Desktop usage appears only through manual entries.
 - Weekly caps are not modelled yet.
