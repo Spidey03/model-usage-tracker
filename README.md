@@ -55,9 +55,29 @@ LaunchAgents don't inherit shell variables. If you set `CLAUDE_CONFIG_DIR` or
 `CLAUDE_USAGE_DATA`, add them to an `EnvironmentVariables` dict in the copied plist.
 Logs go to `/tmp/claude-usage-menubar.log`. To stop, run `launchctl unload` on the same file.
 
+## Provider-reported limits (Claude Code status line)
+
+For claude.ai Pro and Max subscribers, Claude Code passes the provider's own 5-hour and
+7-day usage (percent used and reset time) to the status line. The tracker uses those numbers
+when they are live, so claude.ai and Desktop usage is counted too. Otherwise it falls back to
+the log-based estimate.
+
+Register the capture script in `~/.claude/settings.json`, using absolute paths:
+
+    "statusLine": {
+      "type": "command",
+      "command": "/abs/path/to/model-usage-tracker/.venv/bin/python /abs/path/to/model-usage-tracker/statusline_capture.py"
+    }
+
+It saves `~/.claude-usage/claude_limits.json` and prints a short status line (for example
+`5h 24% · 7d 41%`). Limits are reported only after the first response in a session, and they
+appear only for Pro, Max and Ultra. Claude Code updates them after each assistant message. The
+menu bar marks them as stale after 30 minutes without an update. This uses the documented
+status line interface and makes no network calls.
+
 ## Tests
 
-    python3 -m unittest discover -s tests            # CLI logic
+    python3 -m unittest discover -s tests            # CLI logic and limits
     .venv/bin/python -m unittest discover -s tests   # also menu bar title formatting
 
 ## Adding a provider adapter

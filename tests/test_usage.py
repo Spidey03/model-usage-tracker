@@ -16,6 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import claude_usage as cu  # noqa: E402
 
 NOW = datetime(2026, 11, 15, 12, 0, tzinfo=timezone.utc)
+NO_LIMITS = Path("/nonexistent-dir/claude_limits.json")  # tests never read the real file
 
 
 def entry(provider, minutes_ago, surface="web", model="claude-sonnet-5-5", inp=1000, out=0):
@@ -32,10 +33,13 @@ def make_data(entries, calibrations=()):
 class SummarizeTests(unittest.TestCase):
     def setUp(self):
         self._orig_sources = cu.SOURCES
+        self._orig_limits = cu.LIMITS_FILE
+        cu.LIMITS_FILE = NO_LIMITS
         cu.SOURCES = {}  # no Claude Code logs during tests
 
     def tearDown(self):
         cu.SOURCES = self._orig_sources
+        cu.LIMITS_FILE = self._orig_limits
 
     def test_no_events_returns_empty(self):
         self.assertEqual(cu.summarize(make_data([]), NOW), [])
@@ -80,10 +84,13 @@ class SummarizeTests(unittest.TestCase):
 class CalibrateTests(unittest.TestCase):
     def setUp(self):
         self._orig_sources = cu.SOURCES
+        self._orig_limits = cu.LIMITS_FILE
+        cu.LIMITS_FILE = NO_LIMITS
         cu.SOURCES = {}
 
     def tearDown(self):
         cu.SOURCES = self._orig_sources
+        cu.LIMITS_FILE = self._orig_limits
 
     def test_records_ceiling_for_active_window(self):
         data = make_data([entry("anthropic", 30, inp=4000), entry("anthropic", 10, inp=1000)])
@@ -115,10 +122,13 @@ class CalibrateTests(unittest.TestCase):
 class TimelineTests(unittest.TestCase):
     def setUp(self):
         self._orig_sources = cu.SOURCES
+        self._orig_limits = cu.LIMITS_FILE
+        cu.LIMITS_FILE = NO_LIMITS
         cu.SOURCES = {}
 
     def tearDown(self):
         cu.SOURCES = self._orig_sources
+        cu.LIMITS_FILE = self._orig_limits
 
     def test_buckets_sum_to_total_and_place_events_by_time(self):
         # Window starts at the first event (59 min ago). 5h / 10 buckets = 30 min per slice.
@@ -134,10 +144,13 @@ class TimelineTests(unittest.TestCase):
 class ModelUsageTests(unittest.TestCase):
     def setUp(self):
         self._orig_sources = cu.SOURCES
+        self._orig_limits = cu.LIMITS_FILE
+        cu.LIMITS_FILE = NO_LIMITS
         cu.SOURCES = {}
 
     def tearDown(self):
         cu.SOURCES = self._orig_sources
+        cu.LIMITS_FILE = self._orig_limits
 
     def test_family_and_weight_helpers(self):
         self.assertEqual(cu.model_family("claude-opus-5-5"), "opus")
