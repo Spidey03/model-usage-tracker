@@ -54,14 +54,16 @@ def provider_header(row):
     return f"{name}: {fmt_tokens(row['total'])} weighted (no ceiling)"
 
 
-def provider_items(row):
+def provider_items(row, on_calibrate):
     items = [rumps.MenuItem(provider_header(row))]
     if not row["active"]:
         return items
     items.append(rumps.MenuItem(
         f"Resets {cu.local(row['window_end'])}  ({row['minutes_left']} min left)"))
     if row["ceiling"] is None:
-        items.append(rumps.MenuItem("No ceiling calibrated yet (run the CLI calibrate command)"))
+        items.append(rumps.MenuItem("No ceiling calibrated yet"))
+    items.append(rumps.MenuItem(
+        "Calibrate…", callback=lambda _, p=row["provider"]: on_calibrate(p)))
     breakdown = rumps.MenuItem("Breakdown")
     for surface, model, v in row["surfaces"]:
         breakdown.add(rumps.MenuItem(f"{surface} · {model}: {v:,.0f}"))
@@ -96,7 +98,7 @@ class UsageMenuBar(rumps.App):
         for i, row in enumerate(rows):
             if i:
                 items.append(rumps.separator)
-            items.extend(provider_items(row))
+            items.extend(provider_items(row, self.calibrate))
         items += [
             rumps.separator,
             rumps.MenuItem(f"Updated {datetime.now().strftime('%H:%M')}"),
@@ -128,6 +130,33 @@ class UsageMenuBar(rumps.App):
                     f"Crossed {level}%. Resets {cu.local(row['window_end'])}.",
                 )
         self._notified = {k: v for k, v in self._notified.items() if k in active_keys}
+
+    def calibrate(self, provider):
+        """Ask for the % the provider's UI shows, then record it for the active window."""
+        win = rumps.Window(
+            message=f"Enter the % {provider} shows for its current window in its usage page.",
+            title=f"Calibrate {provider}",
+            default_text="",
+            ok="Save",
+            cancel="Cancel",
+            dimensions=(160, 24),
+        )
+        resp = win.run()
+        if not resp.clicked:
+            return
+        try:
+            pct = float(resp.text.strip().rstrip("%"))
+        except ValueError:
+            rumps.alert(APP_NAME, "Enter a number such as 40.")
+            return
+        data = cu.load_data()
+        try:
+            cu.calibrate(data, provider, pct, datetime.now(timezone.utc))
+        except ValueError as exc:
+            rumps.alert(APP_NAME, str(exc))
+            return
+        cu.save_data(data)
+        self.refresh()
 
     def open_data(self, _=None):
         target = cu.DATA_FILE if cu.DATA_FILE.exists() else cu.DATA_FILE.parent

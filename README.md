@@ -35,7 +35,9 @@ and providers with no active window show `idle`.
     .venv/bin/pip install -r requirements-menubar.txt
     .venv/bin/python menubar.py
 
-The menu shows reset time and a per-surface/model breakdown for each provider. It refreshes
+The menu shows reset time and a per-surface/model breakdown for each provider. Calibrate…
+records the % the provider's usage page shows for the active window, the same as the CLI
+`calibrate` command. It refreshes
 every 60 seconds. It sends a notification when a window crosses 70% or 90%, once per threshold
 per window. Percentages are estimates from calibration.
 

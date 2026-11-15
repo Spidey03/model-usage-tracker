@@ -267,23 +267,34 @@ def cmd_add(args):
     print(f"Added {args.provider}/{args.surface}/{args.model} at {ts.isoformat()}.")
 
 
-def cmd_calibrate(args):
-    data = load_data()
-    now = datetime.now(timezone.utc)
+def calibrate(data, provider, percent, now):
+    """Record the % a provider's UI shows for its active window. Shared by CLI and menu bar.
+
+    Mutates data (caller saves). Returns (weighted_total, ceiling). Raises ValueError.
+    """
     events = collect(data)
     active = active_windows_by_provider(data, events, now)
-    if args.provider not in active:
-        sys.exit(f"No active window for '{args.provider}'. Send a message there first.")
-    if not 0 < args.percent <= 100:
-        sys.exit("--percent must be greater than 0 and at most 100.")
-    win, prof = active[args.provider]
+    if provider not in active:
+        raise ValueError(f"No active window for '{provider}'. Send a message there first.")
+    if not 0 < percent <= 100:
+        raise ValueError("Percent must be greater than 0 and at most 100.")
+    win, prof = active[provider]
     total = sum(weighted(e, prof) for e in win["events"])
-    ceiling = total / (args.percent / 100)
+    ceiling = total / (percent / 100)
     data["calibrations"].append({
-        "at": now.isoformat(), "provider": args.provider,
-        "window_start": win["start"].isoformat(), "percent": args.percent,
+        "at": now.isoformat(), "provider": provider,
+        "window_start": win["start"].isoformat(), "percent": percent,
         "weighted_total": total, "ceiling": ceiling,
     })
+    return total, ceiling
+
+
+def cmd_calibrate(args):
+    data = load_data()
+    try:
+        total, ceiling = calibrate(data, args.provider, args.percent, datetime.now(timezone.utc))
+    except ValueError as exc:
+        sys.exit(str(exc))
     save_data(data)
     print(f"{args.provider}: {args.percent}% at {total:,.0f} weighted -> ceiling ~{ceiling:,.0f}.")
 
