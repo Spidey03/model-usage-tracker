@@ -3,10 +3,13 @@
     python3 -m unittest discover -s tests          # summarize only
     .venv/bin/python -m unittest discover -s tests  # also runs menu bar tests
 """
+import json
+import os
 import sys
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -109,6 +112,82 @@ class CalibrateTests(unittest.TestCase):
         self.assertEqual(data["calibrations"], [])
 
 
+class TimelineTests(unittest.TestCase):
+    def setUp(self):
+        self._orig_sources = cu.SOURCES
+        cu.SOURCES = {}
+
+    def tearDown(self):
+        cu.SOURCES = self._orig_sources
+
+    def test_buckets_sum_to_total_and_place_events_by_time(self):
+        # Window starts at the first event (59 min ago). 5h / 10 buckets = 30 min per slice.
+        # The 59-min-ago event is at offset 0 (slice 0); the 5-min-ago event is 54 min in (slice 1).
+        data = make_data([entry("anthropic", 59, inp=100), entry("anthropic", 5, inp=300)])
+        (row,) = cu.summarize(data, NOW)
+        self.assertEqual(len(row["timeline"]), cu.TIMELINE_BUCKETS)
+        self.assertAlmostEqual(sum(row["timeline"]), row["total"])
+        self.assertAlmostEqual(row["timeline"][0], 100)
+        self.assertAlmostEqual(row["timeline"][1], 300)
+
+
+class ClaudeCacheTests(unittest.TestCase):
+    def setUp(self):
+        import tempfile
+        self._tmp = tempfile.TemporaryDirectory()
+        self.config = Path(self._tmp.name)
+        self.projects = self.config / "projects" / "p"
+        self.projects.mkdir(parents=True)
+        self._env = os.environ.get("CLAUDE_CONFIG_DIR")
+        os.environ["CLAUDE_CONFIG_DIR"] = str(self.config)
+        cu._CLAUDE_FILE_CACHE.clear()
+
+    def tearDown(self):
+        if self._env is None:
+            os.environ.pop("CLAUDE_CONFIG_DIR", None)
+        else:
+            os.environ["CLAUDE_CONFIG_DIR"] = self._env
+        cu._CLAUDE_FILE_CACHE.clear()
+        self._tmp.cleanup()
+
+    def write(self, name, *records):
+        f = self.projects / name
+        f.write_text("".join(json.dumps(r) + "\n" for r in records))
+        return f
+
+    @staticmethod
+    def rec(msg_id, inp, ts="2026-11-15T11:00:00Z"):
+        return {"timestamp": ts, "uuid": "u-" + msg_id,
+                "message": {"id": msg_id, "model": "claude-sonnet-5-5",
+                            "usage": {"input_tokens": inp, "output_tokens": 0}}}
+
+    def test_unchanged_file_is_not_reparsed(self):
+        self.write("a.jsonl", self.rec("m1", 10))
+        first = cu.anthropic_claude_code({})
+        with mock.patch.object(cu, "_parse_claude_file", side_effect=AssertionError("reparsed")):
+            second = cu.anthropic_claude_code({})
+        self.assertEqual(len(first), 1)
+        self.assertEqual([e["input"] for e in second], [10])
+
+    def test_changed_file_is_reparsed(self):
+        f = self.write("a.jsonl", self.rec("m1", 10))
+        cu.anthropic_claude_code({})
+        self.write("a.jsonl", self.rec("m1", 10), self.rec("m2", 25))  # new line, new size
+        self.assertEqual(sorted(e["input"] for e in cu.anthropic_claude_code({})), [10, 25])
+
+    def test_deleted_file_is_dropped_from_cache(self):
+        f = self.write("a.jsonl", self.rec("m1", 10))
+        cu.anthropic_claude_code({})
+        f.unlink()
+        self.assertEqual(cu.anthropic_claude_code({}), [])
+        self.assertEqual(cu._CLAUDE_FILE_CACHE, {})
+
+    def test_duplicate_message_across_files_counted_once(self):
+        self.write("a.jsonl", self.rec("m1", 10))
+        self.write("b.jsonl", self.rec("m1", 10), self.rec("m2", 5))
+        self.assertEqual(sorted(e["input"] for e in cu.anthropic_claude_code({})), [5, 10])
+
+
 try:
     import menubar  # needs rumps
 except ImportError:
@@ -130,6 +209,11 @@ class TitleTests(unittest.TestCase):
     def test_percent_for_every_provider(self):
         rows = [self.row(percent=42.4), self.row(provider="openai", percent=7.0)]
         self.assertEqual(menubar.format_title(rows), "anthropic 42%  ·  openai 7.0%")
+
+    def test_sparkline_scales_to_busiest_slice(self):
+        self.assertEqual(menubar.sparkline([0, 0, 0]), "▁▁▁")
+        self.assertEqual(menubar.sparkline([0, 4, 8]), "▁▅█")
+        self.assertEqual(menubar.sparkline([]), "")
 
     def test_small_percent_keeps_one_decimal(self):
         self.assertEqual(menubar.format_title([self.row(percent=0.34)]), "anthropic 0.3%")

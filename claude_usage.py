@@ -75,39 +75,65 @@ def profile_for(data, provider):
 #   {"ts": datetime, "provider": str, "surface": str, "model": str,
 #    "input": int, "output": int, "cache_creation": int, "cache_read": int}
 
+_CLAUDE_FILE_CACHE = {}  # path -> ((mtime_ns, size), [(dedupe_key, event), ...])
+
+
+def _parse_claude_file(path):
+    """Parse one session log into (dedupe_key, event) pairs, in file order."""
+    out = []
+    with open(path, encoding="utf-8", errors="ignore") as fh:
+        for line in fh:
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            msg = rec.get("message") or {}
+            usage = msg.get("usage")
+            ts = rec.get("timestamp")
+            model = msg.get("model") or "unknown"
+            if not usage or not ts or model == "<synthetic>":
+                continue
+            key = msg.get("id") or rec.get("uuid")
+            out.append((key, {
+                "ts": parse_ts(ts), "provider": "anthropic", "surface": "claude-code",
+                "model": model,
+                "input": usage.get("input_tokens", 0) or 0,
+                "output": usage.get("output_tokens", 0) or 0,
+                "cache_creation": usage.get("cache_creation_input_tokens", 0) or 0,
+                "cache_read": usage.get("cache_read_input_tokens", 0) or 0,
+            }))
+    return out
+
+
+def _cached_claude_file(path):
+    """Re-parse a log only when its mtime or size changed. Keeps the menu bar cheap on refresh."""
+    st = path.stat()
+    sig = (st.st_mtime_ns, st.st_size)
+    hit = _CLAUDE_FILE_CACHE.get(path)
+    if hit and hit[0] == sig:
+        return hit[1]
+    records = _parse_claude_file(path)
+    _CLAUDE_FILE_CACHE[path] = (sig, records)
+    return records
+
+
 def anthropic_claude_code(_data):
     """Claude Code session logs in ~/.claude/projects, deduplicated by message id."""
     config_dir = Path(os.environ.get("CLAUDE_CONFIG_DIR", Path.home() / ".claude"))
     base = config_dir / "projects"
     if not base.exists():
         return []
+    files = list(base.rglob("*.jsonl"))
+    for stale in set(_CLAUDE_FILE_CACHE) - set(files):  # drop deleted logs
+        del _CLAUDE_FILE_CACHE[stale]
     seen, events = set(), []
-    for f in base.rglob("*.jsonl"):
-        with open(f, encoding="utf-8", errors="ignore") as fh:
-            for line in fh:
-                try:
-                    rec = json.loads(line)
-                except json.JSONDecodeError:
+    for f in files:
+        for key, ev in _cached_claude_file(f):
+            if key:
+                if key in seen:
                     continue
-                msg = rec.get("message") or {}
-                usage = msg.get("usage")
-                ts = rec.get("timestamp")
-                model = msg.get("model") or "unknown"
-                if not usage or not ts or model == "<synthetic>":
-                    continue
-                key = msg.get("id") or rec.get("uuid")
-                if key:
-                    if key in seen:
-                        continue
-                    seen.add(key)
-                events.append({
-                    "ts": parse_ts(ts), "provider": "anthropic", "surface": "claude-code",
-                    "model": model,
-                    "input": usage.get("input_tokens", 0) or 0,
-                    "output": usage.get("output_tokens", 0) or 0,
-                    "cache_creation": usage.get("cache_creation_input_tokens", 0) or 0,
-                    "cache_read": usage.get("cache_read_input_tokens", 0) or 0,
-                })
+                seen.add(key)
+            events.append(ev)
     return events
 
 
@@ -215,8 +241,22 @@ def summarize(data, now):
                 row["percent"] = pct
                 hit = [lvl for lvl in ALERT_LEVELS if pct >= lvl]
                 row["alert"] = max(hit) if hit else None
+            row["timeline"] = window_timeline(win, prof)
         rows.append(row)
     return rows
+
+
+TIMELINE_BUCKETS = 10
+
+
+def window_timeline(win, prof):
+    """Weighted usage per equal slice of the window, oldest first. Used for the menu sparkline."""
+    width = timedelta(hours=prof["window_hours"]) / TIMELINE_BUCKETS
+    buckets = [0.0] * TIMELINE_BUCKETS
+    for e in win["events"]:
+        idx = min(int((e["ts"] - win["start"]) / width), TIMELINE_BUCKETS - 1)
+        buckets[idx] += weighted(e, prof)
+    return buckets
 
 
 # ---------- commands ----------
