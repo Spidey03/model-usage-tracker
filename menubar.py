@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""macOS menu bar view of claude_usage. Read-only (Phase 1).
+"""macOS menu bar view of claude_usage.
 
 Needs rumps: pip install -r requirements-menubar.txt
 Run: .venv/bin/python menubar.py
@@ -14,6 +14,7 @@ from pathlib import Path
 import rumps
 
 import claude_usage as cu
+import installer
 
 REFRESH_SECONDS = 60
 APP_NAME = "Claude Usage"
@@ -43,12 +44,7 @@ def sparkline(values):
                    for v in values)
 
 
-def fmt_tokens(n):
-    if n >= 1_000_000:
-        return f"{n / 1_000_000:.1f}M"
-    if n >= 1_000:
-        return f"{n / 1_000:.0f}k"
-    return f"{n:.0f}"
+fmt_tokens = cu.fmt_count
 
 
 def fmt_percent(pct):
@@ -60,7 +56,9 @@ def title_part(row):
     if not row["active"]:
         return f"{name} idle"
     if row["percent"] is not None:
-        return f"{name} {fmt_percent(row['percent'])}"
+        # "~" marks a log estimate, "?" a provider figure that has gone stale.
+        mark = {"estimate": ("~", ""), "stale": ("", "?")}.get(row.get("freshness"), ("", ""))
+        return f"{name} {mark[0]}{fmt_percent(row['percent'])}{mark[1]}"
     return f"{name} {fmt_tokens(row['total'])}"
 
 
@@ -109,10 +107,16 @@ def provider_items(row, on_calibrate, models, now):
     if row["weekly_percent"] is not None:
         items.append(rumps.MenuItem(
             f"Weekly: {row['weekly_percent']:.0f}%  (resets {cu.local(row['weekly_resets_at'])})"))
+        line = cu.forecast_text(row["weekly_forecast_percent"], row["weekly_hits_at"], "weekly reset")
+        if line:
+            items.append(rumps.MenuItem(f"Weekly, {line[0].lower()}{line[1:]}"))
     if not row["active"]:
         return items
     items.append(rumps.MenuItem(
         f"Resets {cu.local(row['window_end'])}  ({row['minutes_left']} min left)"))
+    line = cu.forecast_text(row["forecast_percent"], row["forecast_hits_at"])
+    if line:
+        items.append(rumps.MenuItem(line))
     if row["source"] == "provider":
         items.append(rumps.MenuItem(freshness_text(row, now) or "Live from Claude Code"))
         if row["estimate_total"] is not None:
@@ -138,6 +142,27 @@ def provider_items(row, on_calibrate, models, now):
     return items
 
 
+def history_item(rows):
+    """Submenu: one bar per day, then the busiest projects over the same days."""
+    menu = rumps.MenuItem(f"Last {len(rows)} days")
+    top = max((r["tokens"] for r in rows), default=0)
+    for r in rows:
+        day = datetime.strptime(r["day"], "%Y-%m-%d").strftime("%a %d")
+        menu.add(rumps.MenuItem(f"{day}  {fmt_tokens(r['tokens']):>6}  {cu.bar(r['tokens'], top, 12)}"))
+    projects = cu.history_totals(rows, "by_project")[:5]
+    if projects:
+        menu.add(rumps.separator)
+        for name, tokens in projects:
+            menu.add(rumps.MenuItem(f"{name}  ·  {fmt_tokens(tokens)}"))
+    return menu
+
+
+def weekly_alert_level(row):
+    pct = row.get("weekly_percent")
+    hit = [lvl for lvl in cu.ALERT_LEVELS if pct is not None and pct >= lvl]
+    return max(hit) if hit else None
+
+
 class UsageMenuBar(rumps.App):
     def __init__(self):
         super().__init__(APP_NAME, title="Claude Usage", icon=ICON_PATH, template=True,
@@ -151,17 +176,19 @@ class UsageMenuBar(rumps.App):
         try:
             data = cu.load_data()
             now = datetime.now(timezone.utc)
+            cu.maintain(data, now)
             rows = cu.summarize(data, now)
             models = cu.model_usage(data, now)
+            history = cu.history_rows(data, now, days=7)
         except Exception as exc:  # keep the menu bar alive on bad data
             self.title = "Usage ⚠"
             self._rebuild_menu([rumps.MenuItem(f"Error: {exc}")])
             return
         self.title = format_title(rows)
-        self._rebuild_menu(self._build_items(rows, models, datetime.now(timezone.utc)))
+        self._rebuild_menu(self._build_items(rows, models, now, history))
         self._alert(rows)
 
-    def _build_items(self, rows, models, now):
+    def _build_items(self, rows, models, now, history=()):
         items = []
         if not rows:
             items.append(rumps.MenuItem("No usage found. Run Claude Code or use the CLI add command."))
@@ -170,6 +197,11 @@ class UsageMenuBar(rumps.App):
                 items.append(rumps.separator)
             mine = [m for m in models if m["provider"] == row["provider"]]
             items.extend(provider_items(row, self.calibrate, mine, now))
+        if any(r["tokens"] for r in history):
+            items += [rumps.separator, history_item(history)]
+        if installer.statusline_state() == "none":
+            items += [rumps.separator,
+                      rumps.MenuItem("Enable live limits from Claude Code…", callback=self.enable_live)]
         items += [
             rumps.separator,
             rumps.MenuItem(f"Updated {datetime.now().strftime('%H:%M')}"),
@@ -200,7 +232,26 @@ class UsageMenuBar(rumps.App):
                     f"{row['provider']} at {row['percent']:.0f}% ({source_label(row)})",
                     f"Crossed {level}%. Resets {cu.local(row['window_end'])}.",
                 )
+            weekly = weekly_alert_level(row)
+            if weekly:
+                key = (row["provider"] + " weekly", row["weekly_resets_at"].isoformat())
+                active_keys.add(key)
+                if weekly > self._notified.get(key, 0):
+                    self._notified[key] = weekly
+                    rumps.notification(
+                        APP_NAME, f"{row['provider']} weekly limit at {row['weekly_percent']:.0f}%",
+                        f"Crossed {weekly}%. Resets {cu.local(row['weekly_resets_at'])}.")
         self._notified = {k: v for k, v in self._notified.items() if k in active_keys}
+
+    def enable_live(self, _=None):
+        """Register the status line hook, so Claude Code reports the provider's own figures."""
+        try:
+            installer.install_statusline(installer.settings_path(), installer.statusline_command())
+        except installer.InstallError as exc:
+            rumps.alert(APP_NAME, str(exc))
+            return
+        rumps.alert(APP_NAME, "Done. Live limits appear after your next message in Claude Code.")
+        self.refresh()
 
     def calibrate(self, provider):
         """Ask for the % the provider's UI shows, then record it for the active window."""

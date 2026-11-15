@@ -4,12 +4,24 @@ Tracks AI usage across providers and surfaces, grouped into each provider's roll
 limit windows. The CLI uses Python 3 standard library only. The optional macOS menu
 bar app needs `rumps`.
 
+## Setup
+
+    python3 claude_usage.py install      # status line hook + menu bar login item (macOS)
+    python3 claude_usage.py doctor       # check every part; exits 1 if something is broken
+
+`install` registers the status line hook in Claude Code's `settings.json` and keeps a
+timestamped backup next to it. It will not replace another status line unless you pass
+`--force`. It also creates `.venv` with `rumps` if needed and loads the login item. Use
+`--no-menubar` for the hook only, and `uninstall` to remove both. Send one message in Claude
+Code afterwards, then run `doctor` to confirm the first reading arrived.
+
 ## Quick start
 
     python3 claude_usage.py report                 # current window per provider
     python3 claude_usage.py add --model claude-sonnet-5-5 --input 2000 --output 900 --surface web
     python3 claude_usage.py calibrate --provider anthropic --percent 40   # % shown in /usage
     python3 claude_usage.py models                 # every model: all-time use, share of limit
+    python3 claude_usage.py history                # tokens per day; --by model|project, --days N
     python3 claude_usage.py providers              # adapters, profiles, data file
 
 ## How it works
@@ -23,18 +35,31 @@ bar app needs `rumps`.
 - **Windows** start at the first event after the previous window ends, matching the
   rolling 5-hour rule. Each provider has its own windows.
 - **Ceilings** are estimated from calibration. The report shows an alert at 70% and 90%.
+  While the provider's own figure is live, the tracker calibrates itself from it (one
+  automatic entry per window), so the log estimate needs no manual calibration.
+- **Forecasts** project the current pace to the reset. The 5-hour forecast follows the last
+  hour of logged usage. The weekly forecast uses the week's average and starts after 12 hours.
+- **History** keeps daily totals per model and project in the data file, so they survive
+  Claude Code deleting old session logs.
 
 Data is stored in `~/.claude-usage/data.json` (override with `CLAUDE_USAGE_DATA`).
 
 ## Menu bar (macOS)
 
-A read-only menu bar view. The title shows every provider's current window, for example
-`anthropic 42%  ·  openai 7%`. Providers without a calibrated ceiling show weighted tokens,
-and providers with no active window show `idle`.
+The title shows every provider's current window, for example `anthropic 42%  ·  openai ~7%`.
+A plain figure is the provider's own and current. `~` marks an estimate from the logs, and a
+trailing `?` marks a provider figure with no update for 30 minutes. Providers without a
+ceiling show weighted tokens, and providers with no active window show `idle`.
+
+`install` sets this up. To run it by hand instead:
 
     python3 -m venv .venv
     .venv/bin/pip install -r requirements-menubar.txt
     .venv/bin/python menubar.py
+
+Each provider also shows a forecast ("At this pace: limit reached 15:40, before the reset"),
+and a **Last 7 days** submenu shows tokens per day and the busiest projects. If the status
+line hook is missing, the menu offers **Enable live limits from Claude Code…**.
 
 The menu shows reset time, an Activity sparkline (usage across the current window in 10
 slices), and a per-surface/model breakdown for each provider. Claude Code logs are cached by
@@ -43,9 +68,10 @@ the current window's limit. Providers and model families have their own icons. C
 records the % the provider's usage page shows for the active window, the same as the CLI
 `calibrate` command. It refreshes
 every 60 seconds. It sends a notification when a window crosses 70% or 90%, once per threshold
-per window. Percentages are estimates from calibration.
+per window, and the same for the weekly limit.
 
-To start at login, copy the LaunchAgent template and fill in the project path:
+`install` loads the login item. To do it by hand, copy the LaunchAgent template and fill in
+the project path:
 
     sed "s|__PROJECT_DIR__|$PWD|g" launchagent/local.claude-usage-menubar.plist.template \
         > ~/Library/LaunchAgents/local.claude-usage-menubar.plist
@@ -62,7 +88,8 @@ For claude.ai Pro and Max subscribers, Claude Code passes the provider's own 5-h
 when they are live, so claude.ai and Desktop usage is counted too. Otherwise it falls back to
 the log-based estimate.
 
-Register the capture script in `~/.claude/settings.json`, using absolute paths:
+`install` registers the capture script. The entry it writes to `~/.claude/settings.json`
+looks like this:
 
     "statusLine": {
       "type": "command",
@@ -99,5 +126,9 @@ Verify the provider's log or usage format before writing the adapter.
   and are estimates.
 - Limits are per provider. Models are not limited separately, so the model list shows
   each model's share of the shared window rather than its own cap.
-- Web and Desktop usage appears only through manual entries.
-- Weekly caps are not modelled yet.
+- Provider figures arrive only while Claude Code is in use. Usage on claude.ai or Desktop
+  alone is not seen until the next Claude Code message, and the figure is marked stale
+  meanwhile.
+- Automatic ceilings err low, because the provider's percentage includes claude.ai and
+  Desktop usage that the logs cannot see. The log estimate therefore errs high.
+- Forecasts assume the current pace continues.
