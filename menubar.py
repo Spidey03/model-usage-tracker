@@ -17,8 +17,21 @@ import claude_usage as cu
 
 REFRESH_SECONDS = 60
 APP_NAME = "Claude Usage"
-ICON_PATH = str(Path(__file__).resolve().parent / "assets" / "menubarTemplate.png")
+ASSETS = Path(__file__).resolve().parent / "assets"
+ICON_PATH = str(ASSETS / "menubarTemplate.png")
 SPARK_CHARS = "▁▂▃▄▅▆▇█"
+
+
+def icon_file(name):
+    return str(ASSETS / "icons" / f"{name}.png")
+
+
+def provider_icon(provider):
+    return icon_file("provider-anthropic" if provider == "anthropic" else "provider-default")
+
+
+def model_icon(family):
+    return icon_file(f"model-{family}" if family in cu.MODEL_FAMILIES else "model-other")
 
 
 def sparkline(values):
@@ -66,8 +79,18 @@ def provider_header(row):
     return f"{name}: {fmt_tokens(row['total'])} weighted (no ceiling)"
 
 
-def provider_items(row, on_calibrate):
-    items = [rumps.MenuItem(provider_header(row))]
+def model_title(r):
+    title = f"{r['model']}  ·  {fmt_tokens(r['tokens'])} all time"
+    if r["limit_pct"] is not None and r["window_weighted"]:
+        title += f"  ·  {fmt_percent(r['limit_pct'])} of limit"
+    elif r["window_weighted"]:
+        title += f"  ·  {fmt_tokens(r['window_weighted'])} this window"
+    return title
+
+
+def provider_items(row, on_calibrate, models):
+    header = rumps.MenuItem(provider_header(row), icon=provider_icon(row["provider"]), template=True)
+    items = [header]
     if not row["active"]:
         return items
     items.append(rumps.MenuItem(
@@ -81,6 +104,11 @@ def provider_items(row, on_calibrate):
     for surface, model, v in row["surfaces"]:
         breakdown.add(rumps.MenuItem(f"{surface} · {model}: {v:,.0f}"))
     items.append(breakdown)
+    if models:
+        submenu = rumps.MenuItem("Models")
+        for r in models:
+            submenu.add(rumps.MenuItem(model_title(r), icon=model_icon(r["family"]), template=True))
+        items.append(submenu)
     return items
 
 
@@ -96,23 +124,26 @@ class UsageMenuBar(rumps.App):
     def refresh(self, _=None):
         try:
             data = cu.load_data()
-            rows = cu.summarize(data, datetime.now(timezone.utc))
+            now = datetime.now(timezone.utc)
+            rows = cu.summarize(data, now)
+            models = cu.model_usage(data, now)
         except Exception as exc:  # keep the menu bar alive on bad data
             self.title = "Usage ⚠"
             self._rebuild_menu([rumps.MenuItem(f"Error: {exc}")])
             return
         self.title = format_title(rows)
-        self._rebuild_menu(self._build_items(rows))
+        self._rebuild_menu(self._build_items(rows, models))
         self._alert(rows)
 
-    def _build_items(self, rows):
+    def _build_items(self, rows, models):
         items = []
         if not rows:
             items.append(rumps.MenuItem("No usage found. Run Claude Code or use the CLI add command."))
         for i, row in enumerate(rows):
             if i:
                 items.append(rumps.separator)
-            items.extend(provider_items(row, self.calibrate))
+            mine = [m for m in models if m["provider"] == row["provider"]]
+            items.extend(provider_items(row, self.calibrate, mine))
         items += [
             rumps.separator,
             rumps.MenuItem(f"Updated {datetime.now().strftime('%H:%M')}"),
