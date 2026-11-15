@@ -74,6 +74,41 @@ class SummarizeTests(unittest.TestCase):
         self.assertEqual([r["provider"] for r in rows], ["anthropic", "openai"])
 
 
+class CalibrateTests(unittest.TestCase):
+    def setUp(self):
+        self._orig_sources = cu.SOURCES
+        cu.SOURCES = {}
+
+    def tearDown(self):
+        cu.SOURCES = self._orig_sources
+
+    def test_records_ceiling_for_active_window(self):
+        data = make_data([entry("anthropic", 30, inp=4000), entry("anthropic", 10, inp=1000)])
+        total, ceiling = cu.calibrate(data, "anthropic", 50, NOW)
+        self.assertEqual(total, 5000)
+        self.assertAlmostEqual(ceiling, 10000.0)
+        (cal,) = data["calibrations"]
+        self.assertEqual(cal["provider"], "anthropic")
+        self.assertEqual(cal["percent"], 50)
+        self.assertEqual(cal["window_start"], (NOW - timedelta(minutes=30)).isoformat())
+        # the ceiling feeds back into summarize()
+        (row,) = cu.summarize(data, NOW)
+        self.assertAlmostEqual(row["percent"], 50.0)
+
+    def test_no_active_window_raises_and_records_nothing(self):
+        data = make_data([entry("openai", 6 * 60)])
+        with self.assertRaises(ValueError):
+            cu.calibrate(data, "openai", 40, NOW)
+        self.assertEqual(data["calibrations"], [])
+
+    def test_rejects_out_of_range_percent(self):
+        data = make_data([entry("anthropic", 5)])
+        for bad in (0, -5, 101):
+            with self.assertRaises(ValueError):
+                cu.calibrate(data, "anthropic", bad, NOW)
+        self.assertEqual(data["calibrations"], [])
+
+
 try:
     import menubar  # needs rumps
 except ImportError:
