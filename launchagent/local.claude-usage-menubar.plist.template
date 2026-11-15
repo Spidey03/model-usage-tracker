@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Login item for the menu bar app. Replace __PROJECT_DIR__ with the absolute
+  path to this repo, then copy the result to ~/Library/LaunchAgents/ and load it.
+  See README "Menu bar" for the full steps.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>local.claude-usage-menubar</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>__PROJECT_DIR__/.venv/bin/python</string>
+        <string>__PROJECT_DIR__/menubar.py</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>__PROJECT_DIR__</string>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/tmp/claude-usage-menubar.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/claude-usage-menubar.log</string>
+</dict>
+</plist>
