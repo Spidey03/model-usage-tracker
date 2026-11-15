@@ -1,7 +1,8 @@
 # claude-usage-tracker
 
 Tracks AI usage across providers and surfaces, grouped into each provider's rolling
-limit windows. Python 3, standard library only.
+limit windows. The CLI uses Python 3 standard library only. The optional macOS menu
+bar app needs `rumps`.
 
 ## Quick start
 
@@ -23,6 +24,35 @@ limit windows. Python 3, standard library only.
 - **Ceilings** are estimated from calibration. The report shows an alert at 70% and 90%.
 
 Data is stored in `~/.claude-usage/data.json` (override with `CLAUDE_USAGE_DATA`).
+
+## Menu bar (macOS)
+
+A read-only menu bar view. The title shows every provider's current window, for example
+`anthropic 42%  ·  openai 7%`. Providers without a calibrated ceiling show weighted tokens,
+and providers with no active window show `idle`.
+
+    python3 -m venv .venv
+    .venv/bin/pip install -r requirements-menubar.txt
+    .venv/bin/python menubar.py
+
+The menu shows reset time and a per-surface/model breakdown for each provider. It refreshes
+every 60 seconds. It sends a notification when a window crosses 70% or 90%, once per threshold
+per window. Percentages are estimates from calibration.
+
+To start at login, copy the LaunchAgent template and fill in the project path:
+
+    sed "s|__PROJECT_DIR__|$PWD|g" launchagent/local.claude-usage-menubar.plist.template \
+        > ~/Library/LaunchAgents/local.claude-usage-menubar.plist
+    launchctl load ~/Library/LaunchAgents/local.claude-usage-menubar.plist
+
+LaunchAgents don't inherit shell variables. If you set `CLAUDE_CONFIG_DIR` or
+`CLAUDE_USAGE_DATA`, add them to an `EnvironmentVariables` dict in the copied plist.
+Logs go to `/tmp/claude-usage-menubar.log`. To stop, run `launchctl unload` on the same file.
+
+## Tests
+
+    python3 -m unittest discover -s tests            # CLI logic
+    .venv/bin/python -m unittest discover -s tests   # also menu bar title formatting
 
 ## Adding a provider adapter
 

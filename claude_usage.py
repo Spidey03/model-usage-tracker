@@ -181,6 +181,44 @@ def active_windows_by_provider(data, events, now):
     return out
 
 
+def summarize(data, now):
+    """One row per provider with events. Shared by the CLI report and the menu bar.
+
+    Each row: provider, active, window_start, window_end, minutes_left, total (weighted),
+    surfaces [(surface, model, weighted)] sorted by size, ceiling, percent (None if no
+    ceiling), alert (highest ALERT_LEVELS threshold reached, or None).
+    """
+    events = collect(data)
+    rows = []
+    for prov in providers_in(events):
+        prof = profile_for(data, prov)
+        evs = [e for e in events if e["provider"] == prov]
+        win = active_window(build_windows(evs, timedelta(hours=prof["window_hours"])), now)
+        row = {"provider": prov, "active": win is not None, "window_start": None,
+               "window_end": None, "minutes_left": None, "total": 0.0, "surfaces": [],
+               "ceiling": None, "percent": None, "alert": None}
+        if win:
+            per = {}
+            for e in win["events"]:
+                k = (e["surface"], e["model"])
+                per[k] = per.get(k, 0.0) + weighted(e, prof)
+            total = sum(per.values())
+            ceiling = ceiling_estimate(data, prov, win["start"])
+            row.update(
+                window_start=win["start"], window_end=win["end"],
+                minutes_left=int((win["end"] - now).total_seconds() // 60), total=total,
+                surfaces=sorted(((s, m, v) for (s, m), v in per.items()), key=lambda r: -r[2]),
+                ceiling=ceiling,
+            )
+            if ceiling:
+                pct = total / ceiling * 100
+                row["percent"] = pct
+                hit = [lvl for lvl in ALERT_LEVELS if pct >= lvl]
+                row["alert"] = max(hit) if hit else None
+        rows.append(row)
+    return rows
+
+
 # ---------- commands ----------
 
 def local(dt):
@@ -190,37 +228,27 @@ def local(dt):
 def cmd_report(args):
     data = load_data()
     now = datetime.now(timezone.utc)
-    events = collect(data)
-    active = active_windows_by_provider(data, events, now)
-    if not events:
+    rows = summarize(data, now)
+    if not rows:
         print("No usage found. Run Claude Code, or log usage with: add --model ...")
         return
-    if args.provider:
-        active = {k: v for k, v in active.items() if k == args.provider}
+    active = [r for r in rows if r["active"] and (not args.provider or r["provider"] == args.provider)]
     if not active:
         print("No active windows. The next message from any tracked provider starts one.")
         return
-    for prov, (win, prof) in sorted(active.items()):
-        total = sum(weighted(e, prof) for e in win["events"])
-        left = int((win["end"] - now).total_seconds() // 60)
+    for r in active:
+        prov = r["provider"]
         print(f"== {prov} ==")
-        print(f"Window started: {local(win['start'])}")
-        print(f"Resets at:      {local(win['end'])}  ({left} min left)")
-        per = {}
-        for e in win["events"]:
-            k = (e["surface"], e["model"])
-            per[k] = per.get(k, 0.0) + weighted(e, prof)
+        print(f"Window started: {local(r['window_start'])}")
+        print(f"Resets at:      {local(r['window_end'])}  ({r['minutes_left']} min left)")
         print(f"  {'surface':<14}{'model':<26}{'weighted':>14}")
-        for (surface, model), v in sorted(per.items(), key=lambda kv: -kv[1]):
+        for surface, model, v in r["surfaces"]:
             print(f"  {surface:<14}{model:<26}{v:>14,.0f}")
-        print(f"  {'TOTAL':<40}{total:>14,.0f}")
-        ceiling = ceiling_estimate(data, prov, win["start"])
-        if ceiling:
-            pct = total / ceiling * 100
-            print(f"Estimated used: {pct:.0f}%  (ceiling ~{ceiling:,.0f}, from calibration)")
-            hit = [lvl for lvl in ALERT_LEVELS if pct >= lvl]
-            if hit:
-                print(f"ALERT: at or above {max(hit)}% of estimated limit.")
+        print(f"  {'TOTAL':<40}{r['total']:>14,.0f}")
+        if r["ceiling"]:
+            print(f"Estimated used: {r['percent']:.0f}%  (ceiling ~{r['ceiling']:,.0f}, from calibration)")
+            if r["alert"]:
+                print(f"ALERT: at or above {r['alert']}% of estimated limit.")
         else:
             print(f"No ceiling calibrated. Read the % in the provider's usage page, then: "
                   f"calibrate --provider {prov} --percent N")
