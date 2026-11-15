@@ -162,12 +162,23 @@ def collect(data):
 
 # ---------- math ----------
 
+def model_weight(prof, model):
+    name = model.lower()
+    return next((w for key, w in prof["model_weights"].items() if key in name), 1.0)
+
+
 def weighted(e, prof):
     tw = prof["token_weights"]
     raw = sum(e[k] * tw.get(k, 1.0) for k in TOKEN_FIELDS)
-    model = e["model"].lower()
-    mw = next((w for name, w in prof["model_weights"].items() if name in model), 1.0)
-    return raw * mw
+    return raw * model_weight(prof, e["model"])
+
+
+MODEL_FAMILIES = ("opus", "sonnet", "haiku")
+
+
+def model_family(model):
+    name = model.lower()
+    return next((f for f in MODEL_FAMILIES if f in name), "other")
 
 
 def build_windows(events, window):
@@ -259,6 +270,47 @@ def window_timeline(win, prof):
     return buckets
 
 
+def model_usage(data, now):
+    """One row per provider and model seen in the logs.
+
+    All-time: requests and raw tokens. Current window: weighted use and its share of the
+    provider's estimated limit (None without a calibrated ceiling). Limits are per provider;
+    models are not limited separately, so the share shows how much of the shared window each uses.
+    """
+    events = collect(data)
+    rows = []
+    for prov in providers_in(events):
+        prof = profile_for(data, prov)
+        evs = [e for e in events if e["provider"] == prov]
+        win = active_window(build_windows(evs, timedelta(hours=prof["window_hours"])), now)
+        per = {}
+        for e in evs:
+            r = per.get(e["model"])
+            if r is None:
+                r = per[e["model"]] = {
+                    "provider": prov, "model": e["model"], "family": model_family(e["model"]),
+                    "weight": model_weight(prof, e["model"]), "requests": 0, "tokens": 0,
+                    "last_seen": None, "window_weighted": 0.0, "window_share": None,
+                    "limit_pct": None,
+                }
+            r["requests"] += 1
+            r["tokens"] += sum(e[k] for k in TOKEN_FIELDS)
+            if r["last_seen"] is None or e["ts"] > r["last_seen"]:
+                r["last_seen"] = e["ts"]
+        if win:
+            for e in win["events"]:
+                per[e["model"]]["window_weighted"] += weighted(e, prof)
+            window_total = sum(r["window_weighted"] for r in per.values())
+            ceiling = ceiling_estimate(data, prov, win["start"])
+            for r in per.values():
+                if window_total:
+                    r["window_share"] = r["window_weighted"] / window_total * 100
+                if ceiling:
+                    r["limit_pct"] = r["window_weighted"] / ceiling * 100
+        rows.extend(sorted(per.values(), key=lambda r: -r["tokens"]))
+    return rows
+
+
 # ---------- commands ----------
 
 def local(dt):
@@ -293,6 +345,24 @@ def cmd_report(args):
             print(f"No ceiling calibrated. Read the % in the provider's usage page, then: "
                   f"calibrate --provider {prov} --percent N")
         print()
+
+
+def cmd_models(_args):
+    data = load_data()
+    rows = model_usage(data, datetime.now(timezone.utc))
+    if not rows:
+        print("No usage found. Run Claude Code, or log usage with: add --model ...")
+        return
+    print(f"{'provider':<11}{'model':<26}{'requests':>9}{'tokens':>14}{'window':>12}"
+          f"{'of limit':>10}{'weight':>8}  last seen")
+    for r in rows:
+        window = f"{r['window_weighted']:,.0f}" if r["window_weighted"] else "-"
+        limit = f"{r['limit_pct']:.1f}%" if r["limit_pct"] is not None else "-"
+        print(f"{r['provider']:<11}{r['model']:<26}{r['requests']:>9,}{r['tokens']:>14,}"
+              f"{window:>12}{limit:>10}{r['weight']:>8.2f}  {local(r['last_seen'])}")
+    print()
+    print("tokens: all time, all four fields. window: weighted use in the current window.")
+    print("of limit: share of the provider's estimated limit (needs calibration). weight: model weight.")
 
 
 def cmd_add(args):
@@ -371,6 +441,7 @@ def main():
     c.add_argument("--percent", type=float, required=True)
     c.set_defaults(fn=cmd_calibrate)
 
+    sub.add_parser("models", help="List models with all-time usage and share of limit").set_defaults(fn=cmd_models)
     sub.add_parser("providers", help="List adapters, profiles, and data file").set_defaults(fn=cmd_providers)
 
     args = p.parse_args()

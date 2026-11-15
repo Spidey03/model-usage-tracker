@@ -131,6 +131,49 @@ class TimelineTests(unittest.TestCase):
         self.assertAlmostEqual(row["timeline"][1], 300)
 
 
+class ModelUsageTests(unittest.TestCase):
+    def setUp(self):
+        self._orig_sources = cu.SOURCES
+        cu.SOURCES = {}
+
+    def tearDown(self):
+        cu.SOURCES = self._orig_sources
+
+    def test_family_and_weight_helpers(self):
+        self.assertEqual(cu.model_family("claude-opus-5-5"), "opus")
+        self.assertEqual(cu.model_family("gpt-x"), "other")
+        prof = {"model_weights": {"opus": 5.0}}
+        self.assertEqual(cu.model_weight(prof, "claude-opus-5-5"), 5.0)
+        self.assertEqual(cu.model_weight(prof, "claude-haiku-5-5"), 1.0)
+
+    def test_all_time_and_window_share(self):
+        data = make_data(
+            [entry("anthropic", 6 * 60, model="claude-opus-5-5", inp=500),     # its window already ended
+             entry("anthropic", 30, model="claude-opus-5-5", inp=1000),         # in window
+             entry("anthropic", 10, model="claude-haiku-5-5", inp=3000)],       # in window
+            calibrations=[{"provider": "anthropic", "window_start": (NOW - timedelta(minutes=30)).isoformat(),
+                           "ceiling": 8000.0}],
+        )
+        data["profiles"]["anthropic"] = dict(cu.DEFAULT_PROFILES["anthropic"],
+                                             model_weights={"opus": 2.0, "sonnet": 1.0, "haiku": 1.0})
+        rows = {r["model"]: r for r in cu.model_usage(data, NOW)}
+        opus, haiku = rows["claude-opus-5-5"], rows["claude-haiku-5-5"]
+        self.assertEqual(opus["requests"], 2)
+        self.assertEqual(opus["tokens"], 1500)                 # all time, includes the old event
+        self.assertEqual(opus["window_weighted"], 2000)        # 1000 tokens * weight 2
+        self.assertEqual(haiku["window_weighted"], 3000)
+        self.assertAlmostEqual(opus["window_share"], 40.0)
+        self.assertAlmostEqual(opus["limit_pct"], 25.0)        # 2000 of 8000
+        self.assertEqual(opus["weight"], 2.0)
+
+    def test_no_window_means_no_window_figures(self):
+        (row,) = cu.model_usage(make_data([entry("openai", 6 * 60, model="gpt-x")]), NOW)
+        self.assertEqual(row["window_weighted"], 0.0)
+        self.assertIsNone(row["window_share"])
+        self.assertIsNone(row["limit_pct"])
+        self.assertEqual(row["requests"], 1)
+
+
 class ClaudeCacheTests(unittest.TestCase):
     def setUp(self):
         import tempfile
@@ -214,6 +257,21 @@ class TitleTests(unittest.TestCase):
         self.assertEqual(menubar.sparkline([0, 0, 0]), "▁▁▁")
         self.assertEqual(menubar.sparkline([0, 4, 8]), "▁▅█")
         self.assertEqual(menubar.sparkline([]), "")
+
+    def test_model_title_with_and_without_limit(self):
+        base = {"model": "claude-opus-5-5", "tokens": 1_500_000, "window_weighted": 0.0,
+                "limit_pct": None}
+        self.assertEqual(menubar.model_title(base), "claude-opus-5-5  ·  1.5M all time")
+        self.assertEqual(menubar.model_title(dict(base, window_weighted=2000.0, limit_pct=25.0)),
+                         "claude-opus-5-5  ·  1.5M all time  ·  25% of limit")
+        self.assertEqual(menubar.model_title(dict(base, window_weighted=2000.0)),
+                         "claude-opus-5-5  ·  1.5M all time  ·  2k this window")
+
+    def test_icons_exist_for_every_family(self):
+        for family in ("opus", "sonnet", "haiku", "other"):
+            self.assertTrue(Path(menubar.model_icon(family)).exists(), family)
+        self.assertTrue(Path(menubar.provider_icon("anthropic")).exists())
+        self.assertTrue(Path(menubar.provider_icon("openai")).exists())
 
     def test_small_percent_keeps_one_decimal(self):
         self.assertEqual(menubar.format_title([self.row(percent=0.34)]), "anthropic 0.3%")
