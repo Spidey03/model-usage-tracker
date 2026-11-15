@@ -207,12 +207,65 @@ def providers_in(events):
     return sorted({e["provider"] for e in events})
 
 
+# ---------- provider-reported limits ----------
+# Claude Code's status line receives rate_limits from the provider for Pro/Max subscribers.
+# statusline_capture.py saves them here. They replace the local estimate while live.
+LIMITS_FILE = DATA_FILE.parent / "claude_limits.json"
+LIMITS_STALE_MINUTES = 30
+
+
+def load_limits():
+    try:
+        return json.loads(LIMITS_FILE.read_text())
+    except (OSError, ValueError):
+        return None
+
+
+def _live_window(limits, key, now):
+    w = (limits or {}).get(key)
+    if not isinstance(w, dict) or w.get("used_percentage") is None or w.get("resets_at") is None:
+        return None
+    end = datetime.fromtimestamp(float(w["resets_at"]), timezone.utc)
+    if end <= now:  # the provider's window has ended; Claude Code drops it too
+        return None
+    return {"end": end, "used_percent": float(w["used_percentage"])}
+
+
+def current_window(data, prov, evs, now):
+    """The window that counts right now for one provider, or None.
+
+    Returns dict(start, end, events, source, used_percent, captured_at). source is
+    "provider" when the provider's own 5-hour reset is live, else "estimate" from the logs.
+    """
+    prof = profile_for(data, prov)
+    window = timedelta(hours=prof["window_hours"])
+    limits = load_limits() if prov == "anthropic" else None
+    live = _live_window(limits, "five_hour", now)
+    if live:
+        start = live["end"] - window
+        captured = (limits or {}).get("captured_at")
+        return {"start": start, "end": live["end"],
+                "events": [e for e in evs if start <= e["ts"] < live["end"]],
+                "source": "provider", "used_percent": live["used_percent"],
+                "captured_at": parse_ts(captured) if captured else None}
+    win = active_window(build_windows(evs, window), now)
+    if not win:
+        return None
+    return dict(win, source="estimate", used_percent=None, captured_at=None)
+
+
+def provider_weekly(now):
+    """The provider's 7-day window, if live. Returns (used_percent, resets_at) or None."""
+    live = _live_window(load_limits(), "seven_day", now)
+    return (live["used_percent"], live["end"]) if live else None
+
+
 def active_windows_by_provider(data, events, now):
     out = {}
     for prov in providers_in(events):
         prof = profile_for(data, prov)
         evs = [e for e in events if e["provider"] == prov]
-        win = active_window(build_windows(evs, timedelta(hours=prof["window_hours"])), now)
+        win = current_window(data, prov, evs, now)
         if win:
             out[prov] = (win, prof)
     return out
@@ -230,10 +283,12 @@ def summarize(data, now):
     for prov in providers_in(events):
         prof = profile_for(data, prov)
         evs = [e for e in events if e["provider"] == prov]
-        win = active_window(build_windows(evs, timedelta(hours=prof["window_hours"])), now)
+        win = current_window(data, prov, evs, now)
         row = {"provider": prov, "active": win is not None, "window_start": None,
                "window_end": None, "minutes_left": None, "total": 0.0, "surfaces": [],
-               "ceiling": None, "percent": None, "alert": None}
+               "ceiling": None, "percent": None, "alert": None, "source": None,
+               "captured_at": None, "weekly_percent": None, "weekly_resets_at": None,
+               "estimate_total": None, "estimate_percent": None}
         if win:
             per = {}
             for e in win["events"]:
@@ -245,14 +300,30 @@ def summarize(data, now):
                 window_start=win["start"], window_end=win["end"],
                 minutes_left=int((win["end"] - now).total_seconds() // 60), total=total,
                 surfaces=sorted(((s, m, v) for (s, m), v in per.items()), key=lambda r: -r[2]),
-                ceiling=ceiling,
+                ceiling=ceiling, source=win["source"], captured_at=win["captured_at"],
             )
-            if ceiling:
+            if win["used_percent"] is not None:  # provider's own number
+                pct = win["used_percent"]
+            elif ceiling:
                 pct = total / ceiling * 100
+            else:
+                pct = None
+            if pct is not None:
                 row["percent"] = pct
                 hit = [lvl for lvl in ALERT_LEVELS if pct >= lvl]
                 row["alert"] = max(hit) if hit else None
             row["timeline"] = window_timeline(win, prof)
+        # Log-based estimate, always shown. It can differ from the provider's window.
+        local = active_window(build_windows(evs, timedelta(hours=prof["window_hours"])), now)
+        if local:
+            est_total = sum(weighted(e, prof) for e in local["events"])
+            est_ceiling = ceiling_estimate(data, prov, local["start"])
+            row["estimate_total"] = est_total
+            row["estimate_percent"] = est_total / est_ceiling * 100 if est_ceiling else None
+        if prov == "anthropic":
+            weekly = provider_weekly(now)
+            if weekly:
+                row["weekly_percent"], row["weekly_resets_at"] = weekly
         rows.append(row)
     return rows
 
@@ -282,7 +353,7 @@ def model_usage(data, now):
     for prov in providers_in(events):
         prof = profile_for(data, prov)
         evs = [e for e in events if e["provider"] == prov]
-        win = active_window(build_windows(evs, timedelta(hours=prof["window_hours"])), now)
+        win = current_window(data, prov, evs, now)
         per = {}
         for e in evs:
             r = per.get(e["model"])
@@ -337,7 +408,17 @@ def cmd_report(args):
         for surface, model, v in r["surfaces"]:
             print(f"  {surface:<14}{model:<26}{v:>14,.0f}")
         print(f"  {'TOTAL':<40}{r['total']:>14,.0f}")
-        if r["ceiling"]:
+        if r["source"] == "provider":
+            print(f"Used: {r['percent']:.0f}%  (provider, from Claude Code status line, "
+                  f"updated {local(r['captured_at']) if r['captured_at'] else 'unknown'})")
+            if r["weekly_percent"] is not None:
+                print(f"Weekly: {r['weekly_percent']:.0f}%  (resets {local(r['weekly_resets_at'])})")
+            if r["alert"]:
+                print(f"ALERT: at or above {r['alert']}% of the provider's limit.")
+            if r["estimate_total"] is not None:
+                print(f"Log estimate: {r['estimate_total']:,.0f} weighted"
+                      + (f"  ({r['estimate_percent']:.0f}%)" if r["estimate_percent"] is not None else ""))
+        elif r["ceiling"]:
             print(f"Estimated used: {r['percent']:.0f}%  (ceiling ~{r['ceiling']:,.0f}, from calibration)")
             if r["alert"]:
                 print(f"ALERT: at or above {r['alert']}% of estimated limit.")

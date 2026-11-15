@@ -70,13 +70,28 @@ def format_title(rows):
     return "  ·  ".join(title_part(r) for r in rows)
 
 
+def source_label(row):
+    return "from Claude Code" if row["source"] == "provider" else "estimate"
+
+
 def provider_header(row):
     name = row["provider"]
     if not row["active"]:
         return f"{name}: no active window"
     if row["percent"] is not None:
-        return f"{name}: {row['percent']:.0f}% used (estimate)"
+        return f"{name}: {row['percent']:.0f}% used ({source_label(row)})"
     return f"{name}: {fmt_tokens(row['total'])} weighted (no ceiling)"
+
+
+def freshness_text(row, now):
+    captured = row["captured_at"]
+    if captured is None:
+        return None
+    age = (now - captured).total_seconds() / 60
+    stamp = cu.local(captured)
+    if age > cu.LIMITS_STALE_MINUTES:
+        return f"Last update from Claude Code: {stamp} (stale; send a message to refresh)"
+    return f"Live from Claude Code · updated {stamp}"
 
 
 def model_title(r):
@@ -88,18 +103,29 @@ def model_title(r):
     return title
 
 
-def provider_items(row, on_calibrate, models):
+def provider_items(row, on_calibrate, models, now):
     header = rumps.MenuItem(provider_header(row), icon=provider_icon(row["provider"]), template=True)
     items = [header]
+    if row["weekly_percent"] is not None:
+        items.append(rumps.MenuItem(
+            f"Weekly: {row['weekly_percent']:.0f}%  (resets {cu.local(row['weekly_resets_at'])})"))
     if not row["active"]:
         return items
     items.append(rumps.MenuItem(
         f"Resets {cu.local(row['window_end'])}  ({row['minutes_left']} min left)"))
+    if row["source"] == "provider":
+        items.append(rumps.MenuItem(freshness_text(row, now) or "Live from Claude Code"))
+        if row["estimate_total"] is not None:
+            est = f"Log estimate: {fmt_tokens(row['estimate_total'])} weighted"
+            if row["estimate_percent"] is not None:
+                est += f" ({fmt_percent(row['estimate_percent'])})"
+            items.append(rumps.MenuItem(est))
     items.append(rumps.MenuItem(f"Activity  {sparkline(row['timeline'])}"))
-    if row["ceiling"] is None:
-        items.append(rumps.MenuItem("No ceiling calibrated yet"))
-    items.append(rumps.MenuItem(
-        "Calibrate…", callback=lambda _, p=row["provider"]: on_calibrate(p)))
+    if row["source"] != "provider":
+        if row["ceiling"] is None:
+            items.append(rumps.MenuItem("No ceiling calibrated yet"))
+        items.append(rumps.MenuItem(
+            "Calibrate…", callback=lambda _, p=row["provider"]: on_calibrate(p)))
     breakdown = rumps.MenuItem("Breakdown")
     for surface, model, v in row["surfaces"]:
         breakdown.add(rumps.MenuItem(f"{surface} · {model}: {v:,.0f}"))
@@ -132,10 +158,10 @@ class UsageMenuBar(rumps.App):
             self._rebuild_menu([rumps.MenuItem(f"Error: {exc}")])
             return
         self.title = format_title(rows)
-        self._rebuild_menu(self._build_items(rows, models))
+        self._rebuild_menu(self._build_items(rows, models, datetime.now(timezone.utc)))
         self._alert(rows)
 
-    def _build_items(self, rows, models):
+    def _build_items(self, rows, models, now):
         items = []
         if not rows:
             items.append(rumps.MenuItem("No usage found. Run Claude Code or use the CLI add command."))
@@ -143,7 +169,7 @@ class UsageMenuBar(rumps.App):
             if i:
                 items.append(rumps.separator)
             mine = [m for m in models if m["provider"] == row["provider"]]
-            items.extend(provider_items(row, self.calibrate, mine))
+            items.extend(provider_items(row, self.calibrate, mine, now))
         items += [
             rumps.separator,
             rumps.MenuItem(f"Updated {datetime.now().strftime('%H:%M')}"),
@@ -171,7 +197,7 @@ class UsageMenuBar(rumps.App):
                 self._notified[key] = level
                 rumps.notification(
                     APP_NAME,
-                    f"{row['provider']} at {row['percent']:.0f}% (estimate)",
+                    f"{row['provider']} at {row['percent']:.0f}% ({source_label(row)})",
                     f"Crossed {level}%. Resets {cu.local(row['window_end'])}.",
                 )
         self._notified = {k: v for k, v in self._notified.items() if k in active_keys}
