@@ -149,5 +149,25 @@ class CaptureTests(LimitsTestCase):
         self.assertAlmostEqual(row["percent"], 64.0)
 
 
+class BothNumbersTests(LimitsTestCase):
+    def test_provider_and_log_estimate_both_reported(self):
+        # Provider window started 210 min ago, so the 250-min-ago event is outside it.
+        # The log window started at that event, so it counts toward the estimate only.
+        self.write_limits(five_used=23.5, five_resets=NOW + timedelta(minutes=90))
+        data = self.data([entry(250, inp=2000), entry(30, inp=4000), entry(5, inp=1000)])
+        (row,) = cu.summarize(data, NOW)
+        self.assertEqual(row["source"], "provider")
+        self.assertEqual(row["total"], 5000)               # provider window only
+        self.assertEqual(row["estimate_total"], 7000)      # log window: all three events
+        self.assertIsNone(row["estimate_percent"])         # no ceiling calibrated
+
+    def test_estimate_percent_when_calibrated(self):
+        self.write_limits(five_used=23.5, five_resets=NOW + timedelta(minutes=90))
+        data = self.data([entry(250, inp=2000), entry(30, inp=4000), entry(5, inp=1000)])
+        data["calibrations"] = [{"provider": "anthropic", "window_start": "x", "ceiling": 14000.0}]
+        (row,) = cu.summarize(data, NOW)
+        self.assertAlmostEqual(row["estimate_percent"], 50.0)
+
+
 if __name__ == "__main__":
     unittest.main()

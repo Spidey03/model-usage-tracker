@@ -287,7 +287,8 @@ def summarize(data, now):
         row = {"provider": prov, "active": win is not None, "window_start": None,
                "window_end": None, "minutes_left": None, "total": 0.0, "surfaces": [],
                "ceiling": None, "percent": None, "alert": None, "source": None,
-               "captured_at": None, "weekly_percent": None, "weekly_resets_at": None}
+               "captured_at": None, "weekly_percent": None, "weekly_resets_at": None,
+               "estimate_total": None, "estimate_percent": None}
         if win:
             per = {}
             for e in win["events"]:
@@ -312,6 +313,13 @@ def summarize(data, now):
                 hit = [lvl for lvl in ALERT_LEVELS if pct >= lvl]
                 row["alert"] = max(hit) if hit else None
             row["timeline"] = window_timeline(win, prof)
+        # Log-based estimate, always shown. It can differ from the provider's window.
+        local = active_window(build_windows(evs, timedelta(hours=prof["window_hours"])), now)
+        if local:
+            est_total = sum(weighted(e, prof) for e in local["events"])
+            est_ceiling = ceiling_estimate(data, prov, local["start"])
+            row["estimate_total"] = est_total
+            row["estimate_percent"] = est_total / est_ceiling * 100 if est_ceiling else None
         if prov == "anthropic":
             weekly = provider_weekly(now)
             if weekly:
@@ -407,6 +415,9 @@ def cmd_report(args):
                 print(f"Weekly: {r['weekly_percent']:.0f}%  (resets {local(r['weekly_resets_at'])})")
             if r["alert"]:
                 print(f"ALERT: at or above {r['alert']}% of the provider's limit.")
+            if r["estimate_total"] is not None:
+                print(f"Log estimate: {r['estimate_total']:,.0f} weighted"
+                      + (f"  ({r['estimate_percent']:.0f}%)" if r["estimate_percent"] is not None else ""))
         elif r["ceiling"]:
             print(f"Estimated used: {r['percent']:.0f}%  (ceiling ~{r['ceiling']:,.0f}, from calibration)")
             if r["alert"]:

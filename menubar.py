@@ -115,6 +115,11 @@ def provider_items(row, on_calibrate, models, now):
         f"Resets {cu.local(row['window_end'])}  ({row['minutes_left']} min left)"))
     if row["source"] == "provider":
         items.append(rumps.MenuItem(freshness_text(row, now) or "Live from Claude Code"))
+        if row["estimate_total"] is not None:
+            est = f"Log estimate: {fmt_tokens(row['estimate_total'])} weighted"
+            if row["estimate_percent"] is not None:
+                est += f" ({fmt_percent(row['estimate_percent'])})"
+            items.append(rumps.MenuItem(est))
     items.append(rumps.MenuItem(f"Activity  {sparkline(row['timeline'])}"))
     if row["source"] != "provider":
         if row["ceiling"] is None:
