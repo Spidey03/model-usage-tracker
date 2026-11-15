@@ -35,7 +35,9 @@ and providers with no active window show `idle`.
     .venv/bin/pip install -r requirements-menubar.txt
     .venv/bin/python menubar.py
 
-The menu shows reset time and a per-surface/model breakdown for each provider. Calibrate…
+The menu shows reset time, an Activity sparkline (usage across the current window in 10
+slices), and a per-surface/model breakdown for each provider. Claude Code logs are cached by
+file mtime, so refreshes only re-read logs that changed. Calibrate…
 records the % the provider's usage page shows for the active window, the same as the CLI
 `calibrate` command. It refreshes
 every 60 seconds. It sends a notification when a window crosses 70% or 90%, once per threshold

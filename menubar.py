@@ -9,6 +9,7 @@ claude_usage.summarize(), the same code the CLI report uses.
 """
 import subprocess
 from datetime import datetime, timezone
+from pathlib import Path
 
 import rumps
 
@@ -16,6 +17,17 @@ import claude_usage as cu
 
 REFRESH_SECONDS = 60
 APP_NAME = "Claude Usage"
+ICON_PATH = str(Path(__file__).resolve().parent / "assets" / "menubarTemplate.png")
+SPARK_CHARS = "▁▂▃▄▅▆▇█"
+
+
+def sparkline(values):
+    """Text bar chart. Scaled to the window's busiest slice; all-zero shows flat."""
+    top = max(values) if values else 0
+    if top <= 0:
+        return SPARK_CHARS[0] * len(values)
+    return "".join(SPARK_CHARS[min(len(SPARK_CHARS) - 1, int(v / top * (len(SPARK_CHARS) - 1) + 0.5))]
+                   for v in values)
 
 
 def fmt_tokens(n):
@@ -60,6 +72,7 @@ def provider_items(row, on_calibrate):
         return items
     items.append(rumps.MenuItem(
         f"Resets {cu.local(row['window_end'])}  ({row['minutes_left']} min left)"))
+    items.append(rumps.MenuItem(f"Activity  {sparkline(row['timeline'])}"))
     if row["ceiling"] is None:
         items.append(rumps.MenuItem("No ceiling calibrated yet"))
     items.append(rumps.MenuItem(
@@ -73,7 +86,8 @@ def provider_items(row, on_calibrate):
 
 class UsageMenuBar(rumps.App):
     def __init__(self):
-        super().__init__(APP_NAME, title="Claude Usage", quit_button=None)
+        super().__init__(APP_NAME, title="Claude Usage", icon=ICON_PATH, template=True,
+                         quit_button=None)
         self._notified = {}  # (provider, window_start iso) -> highest threshold already alerted
         self.timer = rumps.Timer(self.refresh, REFRESH_SECONDS)
         self.timer.start()
