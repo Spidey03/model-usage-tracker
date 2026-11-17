@@ -632,8 +632,9 @@ def cmd_report(args):
             if r["alert"]:
                 print(f"ALERT: at or above {r['alert']}% of estimated limit.")
         else:
-            print(f"No ceiling calibrated. Run `install` for live limits, or read the % in the "
-                  f"provider's usage page, then: calibrate --provider {prov} --percent N")
+            print("No ceiling calibrated. For live limits, run `install` once, then send a "
+                  "message in Claude Code. Or read the % on the provider's usage page, then: "
+                  f"calibrate --provider {prov} --percent N")
         line = forecast_text(r["forecast_percent"], r["forecast_hits_at"])
         if line:
             print(line)
