@@ -18,6 +18,7 @@ import json
 import os
 import statistics
 import sys
+import tempfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -51,6 +52,7 @@ def load_data():
     data.setdefault("entries", [])
     data.setdefault("calibrations", [])
     data.setdefault("profiles", {})
+    data.setdefault("history", {})
     for name, prof in DEFAULT_PROFILES.items():
         data["profiles"].setdefault(name, prof)
     return data
@@ -58,7 +60,10 @@ def load_data():
 
 def save_data(data):
     DATA_FILE.parent.mkdir(parents=True, exist_ok=True)
-    DATA_FILE.write_text(json.dumps(data, indent=2))
+    fd, tmp = tempfile.mkstemp(dir=DATA_FILE.parent, prefix=".data-", suffix=".json")
+    with os.fdopen(fd, "w") as fh:
+        json.dump(data, fh, indent=2)
+    os.replace(tmp, DATA_FILE)  # atomic: a crash or a second writer never leaves half a file
 
 
 def parse_ts(s):
@@ -74,6 +79,16 @@ def profile_for(data, provider):
 # Each adapter returns a list of events:
 #   {"ts": datetime, "provider": str, "surface": str, "model": str,
 #    "input": int, "output": int, "cache_creation": int, "cache_read": int}
+
+def project_name(cwd):
+    """Short project label from a session's working directory. Worktrees map to their repo."""
+    if not cwd:
+        return None
+    parts = Path(cwd).parts
+    if "worktrees" in parts[:-1]:
+        return parts[parts.index("worktrees") + 1]
+    return parts[-1] if parts else None
+
 
 _CLAUDE_FILE_CACHE = {}  # path -> ((mtime_ns, size), [(dedupe_key, event), ...])
 
@@ -96,7 +111,7 @@ def _parse_claude_file(path):
             key = msg.get("id") or rec.get("uuid")
             out.append((key, {
                 "ts": parse_ts(ts), "provider": "anthropic", "surface": "claude-code",
-                "model": model,
+                "model": model, "project": project_name(rec.get("cwd")),
                 "input": usage.get("input_tokens", 0) or 0,
                 "output": usage.get("output_tokens", 0) or 0,
                 "cache_creation": usage.get("cache_creation_input_tokens", 0) or 0,
@@ -148,6 +163,7 @@ def manual_events(data):
     return [{
         "ts": parse_ts(e["ts"]), "provider": e.get("provider", "anthropic"),
         "surface": e.get("surface", "web"), "model": e.get("model", "unknown"),
+        "project": e.get("project"),
         "input": e.get("input", 0), "output": e.get("output", 0),
         "cache_creation": e.get("cache_creation", 0), "cache_read": e.get("cache_read", 0),
     } for e in data["entries"]]
@@ -260,6 +276,96 @@ def provider_weekly(now):
     return (live["used_percent"], live["end"]) if live else None
 
 
+RECENT_MINUTES = 60          # the pace of the last hour drives the 5-hour forecast
+WEEKLY_MIN_FORECAST_HOURS = 12
+
+
+def forecast(percent, start, end, now, recent_share=None, min_minutes=10):
+    """Project a window's percent to its reset. Returns dict(projected, hits_at) or None.
+
+    recent_share is the fraction of the window's logged usage that fell in the last
+    RECENT_MINUTES. With it the forecast follows the current pace; without it, the
+    window's average pace. hits_at is when 100% is reached, or None if the reset comes first.
+    """
+    if percent is None:
+        return None
+    elapsed = (now - start).total_seconds() / 60
+    left = (end - now).total_seconds() / 60
+    if elapsed < min_minutes or left <= 0:
+        return None
+    if recent_share is not None:
+        rate = percent * recent_share / min(RECENT_MINUTES, elapsed)
+    else:
+        rate = percent / elapsed
+    projected = percent + rate * left
+    hits_at = None
+    if percent >= 100:
+        hits_at = now
+    elif projected >= 100:
+        hits_at = now + timedelta(minutes=(100 - percent) / rate)
+    return {"projected": projected, "hits_at": hits_at}
+
+
+def recent_share(win, prof, now):
+    """Fraction of the window's logged usage from the last RECENT_MINUTES, or None if no usage."""
+    total = sum(weighted(e, prof) for e in win["events"])
+    if total <= 0:
+        return None
+    cutoff = now - timedelta(minutes=RECENT_MINUTES)
+    return sum(weighted(e, prof) for e in win["events"] if e["ts"] >= cutoff) / total
+
+
+def freshness(win, now):
+    """"live" (provider figure, recent), "stale" (provider figure, old) or "estimate" (logs)."""
+    if win["source"] != "provider":
+        return "estimate"
+    captured = win["captured_at"]
+    if captured and (now - captured).total_seconds() / 60 <= LIMITS_STALE_MINUTES:
+        return "live"
+    return "stale"
+
+
+AUTO_CAL_MIN_PERCENT = 5   # below this the provider's rounding dominates the ceiling
+AUTO_CAL_KEEP = 30
+
+
+def auto_calibrate(data, now, events=None):
+    """Calibrate the log estimate from a live provider reading. Returns True if data changed.
+
+    Keeps one automatic calibration per provider window (the latest reading wins), so the
+    fallback estimate tracks the provider without manual calibration. The provider's figure
+    includes usage the logs cannot see (claude.ai, Desktop), so these ceilings err low and
+    the estimate errs high.
+    """
+    events = collect(data) if events is None else events
+    changed = False
+    for prov in providers_in(events):
+        prof = profile_for(data, prov)
+        win = current_window(data, prov, [e for e in events if e["provider"] == prov], now)
+        if not win or freshness(win, now) != "live":
+            continue
+        pct = win["used_percent"]
+        total = sum(weighted(e, prof) for e in win["events"])
+        if not AUTO_CAL_MIN_PERCENT <= pct <= 100 or total <= 0:
+            continue
+        key = win["start"].isoformat()
+        cals = data["calibrations"]
+        old = next((c for c in cals if c.get("auto") and c["provider"] == prov
+                    and c["window_start"] == key), None)
+        if old and abs(old["percent"] - pct) < 1:
+            continue
+        if old:
+            cals.remove(old)
+        cals.append({"at": now.isoformat(), "provider": prov, "window_start": key,
+                     "percent": pct, "weighted_total": total, "ceiling": total / (pct / 100),
+                     "auto": True})
+        autos = [c for c in cals if c.get("auto") and c["provider"] == prov]
+        for extra in autos[:-AUTO_CAL_KEEP]:
+            cals.remove(extra)
+        changed = True
+    return changed
+
+
 def active_windows_by_provider(data, events, now):
     out = {}
     for prov in providers_in(events):
@@ -288,7 +394,9 @@ def summarize(data, now):
                "window_end": None, "minutes_left": None, "total": 0.0, "surfaces": [],
                "ceiling": None, "percent": None, "alert": None, "source": None,
                "captured_at": None, "weekly_percent": None, "weekly_resets_at": None,
-               "estimate_total": None, "estimate_percent": None}
+               "estimate_total": None, "estimate_percent": None, "freshness": None,
+               "forecast_percent": None, "forecast_hits_at": None,
+               "weekly_forecast_percent": None, "weekly_hits_at": None}
         if win:
             per = {}
             for e in win["events"]:
@@ -301,6 +409,7 @@ def summarize(data, now):
                 minutes_left=int((win["end"] - now).total_seconds() // 60), total=total,
                 surfaces=sorted(((s, m, v) for (s, m), v in per.items()), key=lambda r: -r[2]),
                 ceiling=ceiling, source=win["source"], captured_at=win["captured_at"],
+                freshness=freshness(win, now),
             )
             if win["used_percent"] is not None:  # provider's own number
                 pct = win["used_percent"]
@@ -312,6 +421,9 @@ def summarize(data, now):
                 row["percent"] = pct
                 hit = [lvl for lvl in ALERT_LEVELS if pct >= lvl]
                 row["alert"] = max(hit) if hit else None
+                fc = forecast(pct, win["start"], win["end"], now, recent_share(win, prof, now))
+                if fc:
+                    row["forecast_percent"], row["forecast_hits_at"] = fc["projected"], fc["hits_at"]
             row["timeline"] = window_timeline(win, prof)
         # Log-based estimate, always shown. It can differ from the provider's window.
         local = active_window(build_windows(evs, timedelta(hours=prof["window_hours"])), now)
@@ -324,6 +436,10 @@ def summarize(data, now):
             weekly = provider_weekly(now)
             if weekly:
                 row["weekly_percent"], row["weekly_resets_at"] = weekly
+                fc = forecast(weekly[0], weekly[1] - timedelta(days=7), weekly[1], now,
+                              min_minutes=WEEKLY_MIN_FORECAST_HOURS * 60)
+                if fc:
+                    row["weekly_forecast_percent"], row["weekly_hits_at"] = fc["projected"], fc["hits_at"]
         rows.append(row)
     return rows
 
@@ -382,15 +498,109 @@ def model_usage(data, now):
     return rows
 
 
+# ---------- history ----------
+# Daily totals per provider, model and project. Claude Code deletes old session logs, so
+# completed days are copied into data["history"] and survive that.
+LOCAL_TZ = None  # None = system timezone. Tests pin it.
+
+
+def daily_usage(data, events):
+    """{day: {"provider|model|project": {"requests", "tokens", "weighted"}}} from events."""
+    days = {}
+    for e in events:
+        day = e["ts"].astimezone(LOCAL_TZ).date().isoformat()
+        key = f"{e['provider']}|{e['model']}|{e.get('project') or ''}"
+        cell = days.setdefault(day, {}).setdefault(key, {"requests": 0, "tokens": 0, "weighted": 0.0})
+        cell["requests"] += 1
+        cell["tokens"] += sum(e[k] for k in TOKEN_FIELDS)
+        cell["weighted"] += weighted(e, profile_for(data, e["provider"]))
+    return days
+
+
+def _merge_days(stored, live):
+    """Per cell, keep whichever side saw more tokens. Logs only shrink, by deletion."""
+    out = {day: dict(cells) for day, cells in stored.items()}
+    for day, cells in live.items():
+        target = out.setdefault(day, {})
+        for key, cell in cells.items():
+            if key not in target or cell["tokens"] > target[key]["tokens"]:
+                target[key] = cell
+    return out
+
+
+def update_history(data, now, events=None):
+    """Store completed days in data["history"]. Returns True if data changed."""
+    events = collect(data) if events is None else events
+    today = now.astimezone(LOCAL_TZ).date().isoformat()
+    done = {d: c for d, c in daily_usage(data, events).items() if d < today}
+    merged = _merge_days(data.setdefault("history", {}), done)
+    if merged == data["history"]:
+        return False
+    data["history"] = merged
+    return True
+
+
+def history_rows(data, now, days=14, events=None):
+    """One row per day, oldest first, for the last `days` days including today.
+
+    Each row: day, requests, tokens, weighted, by_model {model: tokens}, by_project {project: tokens}.
+    """
+    events = collect(data) if events is None else events
+    merged = _merge_days(data.get("history", {}), daily_usage(data, events))
+    today = now.astimezone(LOCAL_TZ).date()
+    rows = []
+    for back in range(days - 1, -1, -1):
+        day = (today - timedelta(days=back)).isoformat()
+        row = {"day": day, "requests": 0, "tokens": 0, "weighted": 0.0, "by_model": {}, "by_project": {}}
+        for key, cell in merged.get(day, {}).items():
+            _prov, model, project = key.split("|", 2)
+            project = project or "(none)"
+            row["requests"] += cell["requests"]
+            row["tokens"] += cell["tokens"]
+            row["weighted"] += cell["weighted"]
+            row["by_model"][model] = row["by_model"].get(model, 0) + cell["tokens"]
+            row["by_project"][project] = row["by_project"].get(project, 0) + cell["tokens"]
+        rows.append(row)
+    return rows
+
+
+def history_totals(rows, field):
+    """Sum by_model or by_project across rows, largest first: [(name, tokens)]."""
+    totals = {}
+    for r in rows:
+        for name, tokens in r[field].items():
+            totals[name] = totals.get(name, 0) + tokens
+    return sorted(totals.items(), key=lambda kv: -kv[1])
+
+
+def maintain(data, now):
+    """Housekeeping after reading: auto-calibrate and store finished days. Saves if needed."""
+    events = collect(data)
+    changed = auto_calibrate(data, now, events)
+    changed = update_history(data, now, events) or changed
+    if changed:
+        save_data(data)
+    return changed
+
+
 # ---------- commands ----------
 
 def local(dt):
     return dt.astimezone().strftime("%Y-%m-%d %H:%M")
 
 
+def forecast_text(pct, hits_at, reset_word="reset"):
+    if pct is None:
+        return None
+    if hits_at:
+        return f"At this pace: limit reached {local(hits_at)}, before the {reset_word}"
+    return f"At this pace: about {min(pct, 100):.0f}% by the {reset_word}"
+
+
 def cmd_report(args):
     data = load_data()
     now = datetime.now(timezone.utc)
+    maintain(data, now)
     rows = summarize(data, now)
     if not rows:
         print("No usage found. Run Claude Code, or log usage with: add --model ...")
@@ -409,10 +619,9 @@ def cmd_report(args):
             print(f"  {surface:<14}{model:<26}{v:>14,.0f}")
         print(f"  {'TOTAL':<40}{r['total']:>14,.0f}")
         if r["source"] == "provider":
+            stale = "  STALE: no update for over 30 min" if r["freshness"] == "stale" else ""
             print(f"Used: {r['percent']:.0f}%  (provider, from Claude Code status line, "
-                  f"updated {local(r['captured_at']) if r['captured_at'] else 'unknown'})")
-            if r["weekly_percent"] is not None:
-                print(f"Weekly: {r['weekly_percent']:.0f}%  (resets {local(r['weekly_resets_at'])})")
+                  f"updated {local(r['captured_at']) if r['captured_at'] else 'unknown'}){stale}")
             if r["alert"]:
                 print(f"ALERT: at or above {r['alert']}% of the provider's limit.")
             if r["estimate_total"] is not None:
@@ -423,8 +632,16 @@ def cmd_report(args):
             if r["alert"]:
                 print(f"ALERT: at or above {r['alert']}% of estimated limit.")
         else:
-            print(f"No ceiling calibrated. Read the % in the provider's usage page, then: "
-                  f"calibrate --provider {prov} --percent N")
+            print(f"No ceiling calibrated. Run `install` for live limits, or read the % in the "
+                  f"provider's usage page, then: calibrate --provider {prov} --percent N")
+        line = forecast_text(r["forecast_percent"], r["forecast_hits_at"])
+        if line:
+            print(line)
+        if r["weekly_percent"] is not None:
+            print(f"Weekly: {r['weekly_percent']:.0f}%  (resets {local(r['weekly_resets_at'])})")
+            line = forecast_text(r["weekly_forecast_percent"], r["weekly_hits_at"], "weekly reset")
+            if line:
+                print("  " + line)
         print()
 
 
@@ -444,6 +661,52 @@ def cmd_models(_args):
     print()
     print("tokens: all time, all four fields. window: weighted use in the current window.")
     print("of limit: share of the provider's estimated limit (needs calibration). weight: model weight.")
+
+
+def fmt_count(n):
+    if n >= 1_000_000:
+        return f"{n / 1_000_000:.1f}M"
+    if n >= 1_000:
+        return f"{n / 1_000:.0f}k"
+    return f"{n:.0f}"
+
+
+def bar(value, top, width=24):
+    return "█" * round(value / top * width) if top > 0 else ""
+
+
+def cmd_history(args):
+    data = load_data()
+    now = datetime.now(timezone.utc)
+    maintain(data, now)
+    rows = history_rows(data, now, days=args.days)
+    if args.by == "day":
+        top = max(r["tokens"] for r in rows)
+        print(f"{'day':<12}{'requests':>9}{'tokens':>9}")
+        for r in rows:
+            print(f"{r['day']:<12}{r['requests']:>9,}{fmt_count(r['tokens']):>9}  {bar(r['tokens'], top)}")
+    else:
+        totals = history_totals(rows, "by_model" if args.by == "model" else "by_project")
+        top = totals[0][1] if totals else 0
+        print(f"{args.by:<34}{'tokens':>9}")
+        for name, tokens in totals:
+            print(f"{name[:32]:<34}{fmt_count(tokens):>9}  {bar(tokens, top)}")
+    print(f"\nLast {args.days} days. Tokens are raw, all four fields.")
+
+
+def cmd_install(args):
+    import installer
+    sys.exit(installer.run_install(menubar=not args.no_menubar, force=args.force))
+
+
+def cmd_uninstall(_args):
+    import installer
+    sys.exit(installer.run_uninstall())
+
+
+def cmd_doctor(_args):
+    import installer
+    sys.exit(installer.run_doctor())
 
 
 def cmd_add(args):
@@ -523,6 +786,18 @@ def main():
     c.set_defaults(fn=cmd_calibrate)
 
     sub.add_parser("models", help="List models with all-time usage and share of limit").set_defaults(fn=cmd_models)
+    h = sub.add_parser("history", help="Usage per day, model or project")
+    h.add_argument("--days", type=int, default=14)
+    h.add_argument("--by", choices=("day", "model", "project"), default="day")
+    h.set_defaults(fn=cmd_history)
+
+    i = sub.add_parser("install", help="Register the status line hook and the menu bar login item")
+    i.add_argument("--no-menubar", action="store_true", help="Only register the status line")
+    i.add_argument("--force", action="store_true", help="Replace an existing status line command")
+    i.set_defaults(fn=cmd_install)
+    sub.add_parser("uninstall", help="Remove the status line hook and login item").set_defaults(fn=cmd_uninstall)
+    sub.add_parser("doctor", help="Check that every part of the setup works").set_defaults(fn=cmd_doctor)
+
     sub.add_parser("providers", help="List adapters, profiles, and data file").set_defaults(fn=cmd_providers)
 
     args = p.parse_args()
