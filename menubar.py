@@ -55,11 +55,11 @@ def title_part(row):
     name = row["provider"]
     if not row["active"]:
         return f"{name} idle"
+    # "~" marks a log estimate, "?" a provider figure that has gone stale.
+    mark = {"estimate": ("~", ""), "stale": ("", "?")}.get(row.get("freshness"), ("", ""))
     if row["percent"] is not None:
-        # "~" marks a log estimate, "?" a provider figure that has gone stale.
-        mark = {"estimate": ("~", ""), "stale": ("", "?")}.get(row.get("freshness"), ("", ""))
         return f"{name} {mark[0]}{fmt_percent(row['percent'])}{mark[1]}"
-    return f"{name} {fmt_tokens(row['total'])}"
+    return f"{name} {mark[0]}{fmt_tokens(row['total'])}{mark[1]}"
 
 
 def format_title(rows):

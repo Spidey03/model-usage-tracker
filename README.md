@@ -9,8 +9,9 @@ bar app needs `rumps`.
     python3 claude_usage.py install      # status line hook + menu bar login item (macOS)
     python3 claude_usage.py doctor       # check every part; exits 1 if something is broken
 
-`install` registers the status line hook in Claude Code's `settings.json` and keeps a
-timestamped backup next to it. It will not replace another status line unless you pass
+`install` registers the status line hook in Claude Code's `settings.json`. When it changes
+that file, it first keeps a timestamped backup next to it; if the hook is already registered,
+it leaves the file alone. It will not replace another status line unless you pass
 `--force`. It also creates `.venv` with `rumps` if needed and loads the login item. Use
 `--no-menubar` for the hook only, and `uninstall` to remove both. Send one message in Claude
 Code afterwards, then run `doctor` to confirm the first reading arrived.

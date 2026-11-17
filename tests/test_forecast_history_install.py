@@ -263,6 +263,10 @@ class TitleMarkTests(unittest.TestCase):
         self.assertEqual(menubar.format_title([self.row("estimate")]), "anthropic ~42%")
         self.assertEqual(menubar.format_title([self.row("stale")]), "anthropic 42%?")
 
+    def test_title_marks_uncalibrated_estimate(self):
+        row = dict(self.row("estimate"), percent=None, total=2_400_000)
+        self.assertEqual(menubar.format_title([row]), "anthropic ~2.4M")
+
 
 if __name__ == "__main__":
     unittest.main()
